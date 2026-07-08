@@ -13,3 +13,6 @@ deploy-stderr.tmp
 .DS_Store
 Thumbs.db
 contracts/**/test_snapshots/*.tsbuildinfo
+*.tsbuildinfo
+frontend/vite.config.js
+frontend/vite.config.d.ts
