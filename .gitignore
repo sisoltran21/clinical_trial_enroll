@@ -16,3 +16,6 @@ contracts/**/test_snapshots/*.tsbuildinfo
 *.tsbuildinfo
 frontend/vite.config.js
 frontend/vite.config.d.ts
+contracts/**/test_snapshots/
+contracts/*/test_snapshots/
+contracts/clinical_trial_enroll/test_snapshots/
