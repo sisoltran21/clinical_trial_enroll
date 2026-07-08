@@ -251,8 +251,8 @@ frontend/src/contractConfig.ts
 
 <pre>
 Network: Stellar testnet
-Contract ID: Pending deployment
-WASM hash: Pending deployment
+Contract ID: CD6QOGTZE2EDXS65JMZ5FZJUFQLUVT5DLV2PSDSPTSUIHZC4RIQU6HBN
+WASM hash: a397e773e65abcde69f953279ce62f6767bf23b36bb741b0641ae03201961b5d
 </pre>
 
 After deployment, update this section with the deployed contract ID and transaction evidence.
