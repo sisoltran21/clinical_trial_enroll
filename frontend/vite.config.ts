@@ -1,7 +1,37 @@
-import { defineConfig } from 'vite'
-import react from '@vitejs/plugin-react'
+/// <reference types="vitest" />
 
-// https://vite.dev/config/
+import { defineConfig } from "vite";
+
 export default defineConfig({
-  plugins: [react()],
-})
+  server: {
+    host: "127.0.0.1",
+    port: 5173
+  },
+  preview: {
+    host: "127.0.0.1",
+    port: 4173
+  },
+  build: {
+    chunkSizeWarningLimit: 1200,
+    rollupOptions: {
+      output: {
+        manualChunks(id: string) {
+          if (id.includes("@stellar/stellar-sdk")) {
+            return "stellar-sdk";
+          }
+
+          if (id.includes("node_modules")) {
+            return "vendor";
+          }
+
+          return undefined;
+        }
+      }
+    }
+  },
+  test: {
+    environment: "jsdom",
+    globals: true,
+    include: ["src/**/*.test.ts"]
+  }
+});

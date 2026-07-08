@@ -1,562 +1,405 @@
 import { useMemo, useState } from "react";
-import * as StellarSdk from "@stellar/stellar-sdk";
 import {
-  getAddress,
-  isConnected,
-  requestAccess,
-  setAllowed,
-  signTransaction,
-} from "@stellar/freighter-api";
+  CONTRACT_ID,
+  NETWORK,
+  RPC_URL,
+  isContractConfigured
+} from "./contractConfig";
+import {
+  createClinicalTrialIntent,
+  createEnrollmentIntent,
+  createReviewIntent,
+  invokeContractIntent
+} from "./services/contractService";
+import { connectWallet, emptyWallet } from "./services/walletService";
+import type {
+  ContractIntent,
+  ContractResult,
+  EnrollmentFormState,
+  ReviewFormState,
+  TrialFormState,
+  WalletState
+} from "./types";
+import "./App.css";
 
-type TxStatus = "idle" | "pending" | "success" | "failed";
-
-type FreighterConnectionResponse =
-  | boolean
-  | {
-      isConnected?: boolean;
-      error?: string;
-    };
-
-type FreighterAddressResponse =
-  | string
-  | {
-      address?: string;
-      error?: string;
-    };
-
-type FreighterSignResponse =
-  | string
-  | {
-      signedTxXdr?: string;
-      signerAddress?: string;
-      error?: string;
-    };
-
-type Trial = {
-  code: string;
-  name: string;
-  sponsor: string;
-  enrollmentCap: number;
-  requestFee: number;
-  status: string;
-  criteriaHash: string;
-  description: string;
+const initialTrialForm: TrialFormState = {
+  trialId: "1",
+  title: "Cardiology Access Trial",
+  targetEnrollments: "25"
 };
 
-const HORIZON_URL = "https://horizon-testnet.stellar.org";
-const EXPLORER_TX_URL = "https://stellar.expert/explorer/testnet/tx/";
+const initialEnrollmentForm: EnrollmentFormState = {
+  trialId: "1",
+  enrollmentId: "101",
+  patientCode: "patient-local-code-101"
+};
 
-const server = new StellarSdk.Horizon.Server(HORIZON_URL);
+const initialReviewForm: ReviewFormState = {
+  enrollmentId: "101",
+  action: "approve"
+};
 
-const trials: Trial[] = [
-  {
-    code: "ONCO",
-    name: "Oncology Trial",
-    sponsor: "NovaBio Research",
-    enrollmentCap: 120,
-    requestFee: 1,
-    status: "Enrollment open",
-    criteriaHash: "0x8f23...onco",
-    description:
-      "A testnet enrollment request flow for an oncology research trial. No real patient data is stored in this demo.",
-  },
-  {
-    code: "VACC",
-    name: "Vaccine Safety Study",
-    sponsor: "HelioPharm Labs",
-    enrollmentCap: 500,
-    requestFee: 1.5,
-    status: "Screening phase",
-    criteriaHash: "0xa91c...vacc",
-    description:
-      "A transparent testnet registry flow for submitting a consent-backed enrollment request to a vaccine safety study.",
-  },
-  {
-    code: "RARE",
-    name: "Rare Disease Registry",
-    sponsor: "Orchid Clinical Network",
-    enrollmentCap: 80,
-    requestFee: 2,
-    status: "Limited slots",
-    criteriaHash: "0x44bd...rare",
-    description:
-      "A registry-style trial enrollment workflow for rare disease research coordination on Stellar Testnet.",
-  },
-];
+function shortAddress(value: string): string {
+  if (!value) {
+    return "Not connected";
+  }
 
-function shortAddress(address: string) {
-  if (!address) return "";
-  return `${address.slice(0, 6)}...${address.slice(-6)}`;
+  return `${value.slice(0, 6)}...${value.slice(-6)}`;
 }
 
-function readConnectionStatus(result: FreighterConnectionResponse) {
-  if (typeof result === "boolean") return result;
-  return Boolean(result.isConnected);
+function resultLabel(result: ContractResult | null): string {
+  if (!result) {
+    return "No contract action yet";
+  }
+
+  if (result.mode === "submitted") {
+    return "Submitted";
+  }
+
+  return "Prepared";
 }
 
-function readAddress(result: FreighterAddressResponse) {
-  if (typeof result === "string") return result;
-  return result.address ?? "";
-}
+export default function App() {
+  const [wallet, setWallet] = useState<WalletState>(emptyWallet());
+  const [trialForm, setTrialForm] = useState<TrialFormState>(initialTrialForm);
+  const [enrollmentForm, setEnrollmentForm] = useState<EnrollmentFormState>(initialEnrollmentForm);
+  const [reviewForm, setReviewForm] = useState<ReviewFormState>(initialReviewForm);
+  const [lastIntent, setLastIntent] = useState<ContractIntent | null>(null);
+  const [lastResult, setLastResult] = useState<ContractResult | null>(null);
+  const [error, setError] = useState("");
 
-function readSignedXdr(result: FreighterSignResponse) {
-  if (typeof result === "string") return result;
-  return result.signedTxXdr ?? "";
-}
+  const contractReady = isContractConfigured();
 
-function App() {
-  const [publicKey, setPublicKey] = useState("");
-  const [balance, setBalance] = useState("0.00");
-  const [selectedTrial, setSelectedTrial] = useState(trials[0].code);
-  const [sponsorAddress, setSponsorAddress] = useState("");
-  const [amount, setAmount] = useState(trials[0].requestFee.toString());
-  const [memo, setMemo] = useState("trial_enroll");
-  const [txStatus, setTxStatus] = useState<TxStatus>("idle");
-  const [txHash, setTxHash] = useState("");
-  const [message, setMessage] = useState(
-    "Connect your Freighter wallet to submit a clinical trial enrollment request."
+  const metrics = useMemo(
+    () => [
+      {
+        label: "Network",
+        value: NETWORK
+      },
+      {
+        label: "Contract",
+        value: contractReady ? "Configured" : "Pending deploy"
+      },
+      {
+        label: "Wallet",
+        value: wallet.connected ? "Connected" : "Disconnected"
+      },
+      {
+        label: "Last action",
+        value: resultLabel(lastResult)
+      }
+    ],
+    [contractReady, lastResult, wallet.connected]
   );
-  const [activity, setActivity] = useState<string[]>([
-    "clinical_trial_enroll loaded on Stellar Testnet.",
-  ]);
 
-  const activeTrial = useMemo(() => {
-    return trials.find((trial) => trial.code === selectedTrial) ?? trials[0];
-  }, [selectedTrial]);
-
-  const txLink = txHash ? `${EXPLORER_TX_URL}${txHash}` : "";
-
-  function addActivity(item: string) {
-    setActivity((current) => [item, ...current].slice(0, 7));
-  }
-
-  function selectTrial(trial: Trial) {
-    setSelectedTrial(trial.code);
-    setAmount(trial.requestFee.toString());
-    setMemo(`enroll_${trial.code}`.slice(0, 28));
-    addActivity(`Selected clinical trial: ${trial.code}.`);
-  }
-
-  async function getWalletAddressWithFallback() {
-    console.log("Connect button clicked.");
+  async function handleConnectWallet() {
+    setError("");
 
     try {
-      const requestResult = (await requestAccess()) as FreighterAddressResponse;
-      const requestedAddress = readAddress(requestResult);
-
-      if (requestedAddress) {
-        console.log("Address from requestAccess:", requestedAddress);
-        return requestedAddress;
-      }
-    } catch (error) {
-      console.warn("requestAccess failed, trying setAllowed + getAddress.", error);
-    }
-
-    await setAllowed();
-
-    const addressResult = (await getAddress()) as FreighterAddressResponse;
-    const walletAddress = readAddress(addressResult);
-
-    if (walletAddress) {
-      console.log("Address from getAddress:", walletAddress);
-      return walletAddress;
-    }
-
-    return "";
-  }
-
-  async function connectWallet() {
-    try {
-      setTxHash("");
-      setTxStatus("idle");
-      setMessage("Opening Freighter connection request...");
-      addActivity("Connect button clicked. Waiting for Freighter.");
-
-      try {
-        const connectedResult = (await isConnected()) as FreighterConnectionResponse;
-        const hasFreighter = readConnectionStatus(connectedResult);
-
-        if (!hasFreighter) {
-          addActivity("Freighter extension may not be detected yet.");
-        }
-      } catch {
-        addActivity("Freighter connection check skipped.");
-      }
-
-      const walletAddress = await getWalletAddressWithFallback();
-
-      if (!walletAddress) {
-        setTxStatus("failed");
-        setMessage(
-          "Could not read wallet address. Unlock Freighter, switch to Testnet, then click Connect again."
-        );
-        addActivity("Wallet connection failed: address unavailable.");
-        return;
-      }
-
-      setPublicKey(walletAddress);
-      setMessage("Wallet connected successfully.");
-      addActivity(`Connected patient wallet ${shortAddress(walletAddress)}.`);
-      await fetchBalance(walletAddress);
-    } catch (error) {
-      console.error("Wallet connection failed:", error);
-      setTxStatus("failed");
-      setMessage(
-        "Wallet connection failed or was rejected. Unlock Freighter, allow this local app, switch to Testnet, then try again."
-      );
-      addActivity("Wallet connection failed or was rejected.");
+      const nextWallet = await connectWallet();
+      setWallet(nextWallet);
+    } catch (connectError) {
+      const message = connectError instanceof Error ? connectError.message : "Unable to connect wallet.";
+      setError(message);
     }
   }
 
-  function disconnectWallet() {
-    setPublicKey("");
-    setBalance("0.00");
-    setTxStatus("idle");
-    setTxHash("");
-    setMessage("Wallet disconnected from the app UI.");
-    addActivity("Wallet disconnected from the app UI.");
+  function handleDisconnectWallet() {
+    setWallet(emptyWallet());
+    setLastIntent(null);
+    setLastResult(null);
+    setError("");
   }
 
-  async function fetchBalance(address = publicKey) {
+  async function runIntent(intent: ContractIntent) {
+    if (!wallet.connected || !wallet.publicKey) {
+      setError("Connect Freighter wallet before preparing a contract action.");
+      return;
+    }
+
+    setError("");
+    setLastIntent(intent);
+
+    const result = await invokeContractIntent(intent, wallet.publicKey);
+
+    setLastResult(result);
+  }
+
+  async function handleCreateTrial() {
     try {
-      if (!address) {
-        setMessage("Connect wallet first before refreshing balance.");
-        return;
-      }
-
-      const account = await server.loadAccount(address);
-      const nativeBalance = account.balances.find(
-        (item) => item.asset_type === "native"
-      );
-
-      const readableBalance = nativeBalance
-        ? Number(nativeBalance.balance).toFixed(2)
-        : "0.00";
-
-      setBalance(readableBalance);
-      setMessage("Balance refreshed from Stellar Testnet.");
-      addActivity(`Balance refreshed: ${readableBalance} XLM.`);
-    } catch (error) {
-      console.error(error);
-      setTxStatus("failed");
-      setMessage(
-        "Could not fetch balance. Make sure your Freighter account is funded on Stellar Testnet."
-      );
-      addActivity("Balance fetch failed.");
+      await runIntent(createClinicalTrialIntent(wallet.publicKey, trialForm));
+    } catch (actionError) {
+      const message = actionError instanceof Error ? actionError.message : "Create trial failed.";
+      setError(message);
     }
   }
 
-  async function submitEnrollmentRequest() {
+  async function handleSubmitEnrollment() {
     try {
-      setTxHash("");
-      setTxStatus("pending");
-      setMessage("Preparing trial enrollment transaction...");
+      const intent = await createEnrollmentIntent(wallet.publicKey, enrollmentForm);
+      await runIntent(intent);
+    } catch (actionError) {
+      const message = actionError instanceof Error ? actionError.message : "Submit enrollment failed.";
+      setError(message);
+    }
+  }
 
-      if (!publicKey) {
-        setTxStatus("failed");
-        setMessage("Please connect your Freighter wallet first.");
-        addActivity("Enrollment request failed: wallet not connected.");
-        return;
-      }
-
-      if (!sponsorAddress || !sponsorAddress.startsWith("G")) {
-        setTxStatus("failed");
-        setMessage(
-          "Please enter a valid Stellar Testnet sponsor address starting with G."
-        );
-        addActivity("Enrollment request failed: invalid sponsor address.");
-        return;
-      }
-
-      const numericAmount = Number(amount);
-
-      if (!numericAmount || numericAmount <= 0) {
-        setTxStatus("failed");
-        setMessage("Please enter a valid XLM amount greater than 0.");
-        addActivity("Enrollment request failed: invalid amount.");
-        return;
-      }
-
-      if (numericAmount > Number(balance)) {
-        setTxStatus("failed");
-        setMessage("Insufficient XLM balance for this enrollment request.");
-        addActivity("Enrollment request failed: insufficient balance.");
-        return;
-      }
-
-      setMessage("Loading patient account from Stellar Testnet...");
-      const sourceAccount = await server.loadAccount(publicKey);
-
-      const safeMemo = memo.trim()
-        ? memo.trim().replace(/\s+/g, "_").slice(0, 28)
-        : "trial_enroll";
-
-      const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
-        fee: StellarSdk.BASE_FEE,
-        networkPassphrase: StellarSdk.Networks.TESTNET,
-      })
-        .addOperation(
-          StellarSdk.Operation.payment({
-            destination: sponsorAddress,
-            asset: StellarSdk.Asset.native(),
-            amount: numericAmount.toString(),
-          })
-        )
-        .addMemo(StellarSdk.Memo.text(safeMemo))
-        .setTimeout(180)
-        .build();
-
-      setMessage("Please approve the enrollment request in Freighter...");
-
-      const signedResult = (await signTransaction(transaction.toXDR(), {
-        networkPassphrase: StellarSdk.Networks.TESTNET,
-      })) as FreighterSignResponse;
-
-      const signedXdr = readSignedXdr(signedResult);
-
-      if (!signedXdr) {
-        setTxStatus("failed");
-        setMessage("Freighter did not return a signed transaction.");
-        addActivity("Enrollment request failed: missing signed transaction XDR.");
-        return;
-      }
-
-      const signedTransaction = StellarSdk.TransactionBuilder.fromXDR(
-        signedXdr,
-        StellarSdk.Networks.TESTNET
-      );
-
-      setMessage("Submitting enrollment request to Stellar Testnet...");
-      addActivity("Enrollment request signed by Freighter.");
-
-      const submittedTx = await server.submitTransaction(signedTransaction);
-
-      setTxHash(submittedTx.hash);
-      setTxStatus("success");
-      setMessage(
-        "Clinical trial enrollment request submitted successfully. Transaction hash is visible below."
-      );
-      addActivity(
-        `Success: ${numericAmount} XLM sent for ${activeTrial.code} enrollment.`
-      );
-
-      await fetchBalance(publicKey);
-    } catch (error) {
-      console.error(error);
-      setTxStatus("failed");
-      setMessage(
-        "Transaction failed or was rejected. Check Freighter Testnet mode, balance, sponsor address, and amount."
-      );
-      addActivity("Enrollment request failed or was rejected.");
+  async function handleReviewEnrollment() {
+    try {
+      await runIntent(createReviewIntent(wallet.publicKey, reviewForm));
+    } catch (actionError) {
+      const message = actionError instanceof Error ? actionError.message : "Review enrollment failed.";
+      setError(message);
     }
   }
 
   return (
-    <main className="app">
-      <nav className="topbar">
-        <div>
-          <p className="eyebrow">Stellar Level 1 dApp</p>
-          <h1>clinical_trial_enroll</h1>
-        </div>
-
-        <div className="wallet-actions">
-          {publicKey ? (
-            <>
-              <button className="ghost-button" onClick={() => fetchBalance()}>
-                Refresh Balance
-              </button>
-              <button className="danger-button" onClick={disconnectWallet}>
-                Disconnect
-              </button>
-            </>
-          ) : (
-            <button className="primary-button" onClick={connectWallet}>
-              Connect Freighter
-            </button>
-          )}
-        </div>
-      </nav>
-
+    <main className="app-shell">
       <section className="hero">
-        <div className="hero-copy">
-          <p className="eyebrow">Clinical enrollment on Stellar Testnet</p>
-          <h2>Submit a trial enrollment request with a signed payment.</h2>
-          <p>
-            This Level 1 version proves the core Stellar flow: Freighter wallet
-            connection, XLM balance display, payment signing, transaction status,
-            and a verifiable Stellar Expert transaction link.
+        <div>
+          <p className="eyebrow">Stellar Level 3 dApp</p>
+          <h1>clinical_trial_enroll</h1>
+          <p className="hero-copy">
+            A Soroban-powered clinical trial enrollment registry for recording trial setup,
+            patient enrollment intent, and sponsor review status without storing private medical
+            data on-chain.
           </p>
-        </div>
 
-        <div className="hero-card">
-          <span>Network</span>
-          <strong>Stellar Testnet</strong>
-          <small>No real patient data is stored</small>
-        </div>
-      </section>
-
-      <section className="stats-grid">
-        <div className="stat-card">
-          <span>Selected Trial</span>
-          <strong>{activeTrial.code}</strong>
-        </div>
-        <div className="stat-card">
-          <span>Sponsor</span>
-          <strong>{activeTrial.sponsor}</strong>
-        </div>
-        <div className="stat-card">
-          <span>Enrollment Cap</span>
-          <strong>{activeTrial.enrollmentCap}</strong>
-        </div>
-        <div className="stat-card">
-          <span>Status</span>
-          <strong>{activeTrial.status}</strong>
-        </div>
-      </section>
-
-      <section className="grid">
-        <div className="panel wallet-panel">
-          <div className="panel-header">
-            <p className="eyebrow">Patient Wallet</p>
-            <h3>Connected Account</h3>
-          </div>
-
-          {publicKey ? (
-            <>
-              <div className="address-box">{publicKey}</div>
-              <div className="metric-row">
-                <div>
-                  <span>XLM Balance</span>
-                  <strong>{balance}</strong>
-                </div>
-                <div>
-                  <span>Status</span>
-                  <strong>Connected</strong>
-                </div>
-              </div>
-            </>
-          ) : (
-            <div className="empty-state">
-              Connect Freighter to show your patient wallet address and XLM balance.
-            </div>
-          )}
-        </div>
-
-        <div className="panel trial-panel">
-          <div className="panel-header">
-            <p className="eyebrow">Trial Registry</p>
-            <h3>Choose Trial</h3>
-          </div>
-
-          <div className="trial-list">
-            {trials.map((trial) => (
-              <button
-                key={trial.code}
-                className={
-                  trial.code === selectedTrial
-                    ? "trial-button active"
-                    : "trial-button"
-                }
-                onClick={() => selectTrial(trial)}
-              >
-                <strong>
-                  {trial.code} · {trial.name}
-                </strong>
-                <span>{trial.status}</span>
-                <small>
-                  Sponsor: {trial.sponsor} · cap {trial.enrollmentCap} · fee {trial.requestFee} XLM
-                </small>
+          <div className="hero-actions">
+            {!wallet.connected ? (
+              <button className="primary-button" onClick={handleConnectWallet}>
+                Connect Freighter
               </button>
-            ))}
-          </div>
+            ) : (
+              <button className="secondary-button" onClick={handleDisconnectWallet}>
+                Disconnect wallet
+              </button>
+            )}
 
-          <div className="trial-detail">
-            <span>{activeTrial.description}</span>
-            <code>Eligibility hash: {activeTrial.criteriaHash}</code>
+            <a
+              className="ghost-button"
+              href="https://stellar.expert/explorer/testnet"
+              target="_blank"
+              rel="noreferrer"
+            >
+              Open testnet explorer
+            </a>
           </div>
         </div>
 
-        <div className="panel payment-panel">
-          <div className="panel-header">
-            <p className="eyebrow">Enrollment Request</p>
-            <h3>Send Testnet XLM</h3>
-          </div>
+        <div className="contract-card">
+          <span className={contractReady ? "status-pill success" : "status-pill warning"}>
+            {contractReady ? "Live contract configured" : "Contract deploy pending"}
+          </span>
 
-          <label>
-            Trial Sponsor Address
-            <input
-              value={sponsorAddress}
-              onChange={(event) => setSponsorAddress(event.target.value)}
-              placeholder="Paste funded Testnet sponsor G... address"
-            />
-          </label>
+          <h2>Contract status</h2>
 
-          <label>
-            Enrollment Request Fee in XLM
-            <input
-              value={amount}
-              onChange={(event) => setAmount(event.target.value)}
-              placeholder="1"
-              type="number"
-              min="0"
-              step="0.1"
-            />
-          </label>
+          <p className="muted">Contract ID</p>
+          <p className="mono break-word">{CONTRACT_ID}</p>
 
-          <label>
-            Memo
-            <input
-              value={memo}
-              onChange={(event) => setMemo(event.target.value)}
-              maxLength={28}
-              placeholder="trial_enroll"
-            />
-          </label>
+          <p className="muted">RPC endpoint</p>
+          <p className="mono break-word">{RPC_URL}</p>
 
-          <button
-            className="primary-button full-width"
-            onClick={submitEnrollmentRequest}
-            disabled={txStatus === "pending"}
-          >
-            {txStatus === "pending" ? "Submitting..." : "Submit Enrollment Request"}
-          </button>
+          <p className="muted">Connected wallet</p>
+          <p className="mono">{shortAddress(wallet.publicKey)}</p>
 
-          <p className="hint">
-            The sponsor account must already exist and be funded on Stellar Testnet.
-          </p>
+          <p className="muted">XLM balance</p>
+          <p className="mono">{wallet.balance}</p>
         </div>
+      </section>
 
-        <div className="panel status-panel">
-          <div className="panel-header">
-            <p className="eyebrow">Transaction Monitor</p>
-            <h3>Status</h3>
-          </div>
+      <section className="metrics-grid">
+        {metrics.map((item) => (
+          <article className="metric-card" key={item.label}>
+            <p>{item.label}</p>
+            <strong>{item.value}</strong>
+          </article>
+        ))}
+      </section>
 
-          <div className={`status-card ${txStatus}`}>
-            <span>{txStatus.toUpperCase()}</span>
-            <p>{message}</p>
-          </div>
+      {error ? <section className="error-panel">{error}</section> : null}
 
-          {txHash && (
-            <div className="tx-box">
-              <span>Transaction Hash</span>
-              <code>{txHash}</code>
-              <a href={txLink} target="_blank" rel="noreferrer">
-                View on Stellar Expert
-              </a>
+      <section className="operations-grid">
+        <article className="operation-card">
+          <div className="card-heading">
+            <span>01</span>
+            <div>
+              <h2>Create trial</h2>
+              <p>Admin creates a public trial record with a target enrollment cap.</p>
             </div>
-          )}
-
-          <div className="activity-feed">
-            <h4>Enrollment Activity Feed</h4>
-            {activity.map((item, index) => (
-              <p key={`${item}-${index}`}>{item}</p>
-            ))}
           </div>
+
+          <label>
+            Trial ID
+            <input
+              value={trialForm.trialId}
+              onChange={(event) =>
+                setTrialForm({
+                  ...trialForm,
+                  trialId: event.target.value
+                })
+              }
+            />
+          </label>
+
+          <label>
+            Trial title
+            <input
+              value={trialForm.title}
+              onChange={(event) =>
+                setTrialForm({
+                  ...trialForm,
+                  title: event.target.value
+                })
+              }
+            />
+          </label>
+
+          <label>
+            Target enrollments
+            <input
+              value={trialForm.targetEnrollments}
+              onChange={(event) =>
+                setTrialForm({
+                  ...trialForm,
+                  targetEnrollments: event.target.value
+                })
+              }
+            />
+          </label>
+
+          <button className="primary-button full-width" onClick={handleCreateTrial}>
+            Prepare create_trial
+          </button>
+        </article>
+
+        <article className="operation-card">
+          <div className="card-heading">
+            <span>02</span>
+            <div>
+              <h2>Submit enrollment</h2>
+              <p>Patient submits an enrollment using a local patient code hashed in the browser.</p>
+            </div>
+          </div>
+
+          <label>
+            Trial ID
+            <input
+              value={enrollmentForm.trialId}
+              onChange={(event) =>
+                setEnrollmentForm({
+                  ...enrollmentForm,
+                  trialId: event.target.value
+                })
+              }
+            />
+          </label>
+
+          <label>
+            Enrollment ID
+            <input
+              value={enrollmentForm.enrollmentId}
+              onChange={(event) =>
+                setEnrollmentForm({
+                  ...enrollmentForm,
+                  enrollmentId: event.target.value
+                })
+              }
+            />
+          </label>
+
+          <label>
+            Local patient code
+            <input
+              value={enrollmentForm.patientCode}
+              onChange={(event) =>
+                setEnrollmentForm({
+                  ...enrollmentForm,
+                  patientCode: event.target.value
+                })
+              }
+            />
+          </label>
+
+          <button className="primary-button full-width" onClick={handleSubmitEnrollment}>
+            Prepare submit_enrollment
+          </button>
+        </article>
+
+        <article className="operation-card">
+          <div className="card-heading">
+            <span>03</span>
+            <div>
+              <h2>Review enrollment</h2>
+              <p>Admin approves or rejects a submitted enrollment record.</p>
+            </div>
+          </div>
+
+          <label>
+            Enrollment ID
+            <input
+              value={reviewForm.enrollmentId}
+              onChange={(event) =>
+                setReviewForm({
+                  ...reviewForm,
+                  enrollmentId: event.target.value
+                })
+              }
+            />
+          </label>
+
+          <label>
+            Review action
+            <select
+              value={reviewForm.action}
+              onChange={(event) =>
+                setReviewForm({
+                  ...reviewForm,
+                  action: event.target.value as ReviewFormState["action"]
+                })
+              }
+            >
+              <option value="approve">Approve</option>
+              <option value="reject">Reject</option>
+            </select>
+          </label>
+
+          <button className="primary-button full-width" onClick={handleReviewEnrollment}>
+            Prepare review action
+          </button>
+        </article>
+      </section>
+
+      <section className="activity-panel">
+        <div>
+          <p className="eyebrow">Transaction monitor</p>
+          <h2>Latest contract action</h2>
         </div>
+
+        {lastIntent ? (
+          <div className="activity-content">
+            <p className="muted">Method</p>
+            <p className="mono">{lastIntent.method}</p>
+
+            <p className="muted">Preview</p>
+            <p>{lastIntent.preview}</p>
+
+            <p className="muted">Result</p>
+            <p>{lastResult?.message ?? "Waiting for result..."}</p>
+
+            {lastResult?.transactionHash ? (
+              <>
+                <p className="muted">Transaction hash</p>
+                <p className="mono break-word">{lastResult.transactionHash}</p>
+              </>
+            ) : null}
+          </div>
+        ) : (
+          <p className="muted">
+            Connect a wallet and prepare a contract operation to see the generated method call.
+          </p>
+        )}
       </section>
     </main>
   );
 }
-
-export default App;
